@@ -1,0 +1,135 @@
+name: MHTML ذخیره صفحه به
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the webpage to download'
+        required: true
+        type: string
+      title:
+        description: 'Optional title for the output file (no spaces/special chars)'
+        required: false
+        type: string
+      extract_links:
+        description: 'استخراج لینک‌های داخل صفحه و ذخیره در فایل جداگانه؟'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pyppeteer beautifulsoup4
+
+      - name: Create Python script
+        run: |
+          cat > save_as_mhtml.py << 'EOF'
+          import asyncio
+          import os
+          import re
+          from pyppeteer import launch
+          from bs4 import BeautifulSoup
+          import sys
+          import argparse
+          
+          async def save_mhtml(url, output_path):
+              browser = await launch(headless=True, args=['--no-sandbox'])
+              page = await browser.newPage()
+              await page.goto(url, waitUntil='networkidle2')
+              
+              # استخراج لینک‌ها
+              content = await page.content()
+              soup = BeautifulSoup(content, 'html.parser')
+              links = []
+              for a in soup.find_all('a', href=True):
+                  href = a['href']
+                  if href.startswith('http') and not href.startswith('javascript:'):
+                      links.append(href)
+              links = list(dict.fromkeys(links))
+              
+              # ذخیره لینک‌ها در فایل جداگانه
+              links_file = output_path.replace('.mhtml', '_links.txt')
+              with open(links_file, 'w', encoding='utf-8') as f:
+                  for link in links:
+                      f.write(link + '\n')
+              
+              # ذخیره MHTML
+              client = await page.target.createCDPSession()
+              await client.send('Page.captureSnapshot', {'format': 'mhtml'})
+              
+              cdp = await page.target.createCDPSession()
+              result = await cdp.send('Page.captureSnapshot', {})
+              with open(output_path, 'w', encoding='utf-8') as f:
+                  f.write(result['data'])
+              
+              await browser.close()
+              return len(links)
+          
+          if __name__ == '__main__':
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--url', required=True)
+              parser.add_argument('--title')
+              parser.add_argument('--extract-links', action='store_true')
+              args = parser.parse_args()
+              
+              title = args.title
+              if not title:
+                  # پاک کردن کاراکترهای غیرمجاز از URL
+                  title = re.sub(r'[^\w\-_\.]', '_', args.url.split('//')[-1].split('/')[0])
+              
+              os.makedirs('download', exist_ok=True)
+              output_file = f"download/{title}.mhtml"
+              
+              link_count = asyncio.get_event_loop().run_until_complete(
+                  save_mhtml(args.url, output_file)
+              )
+              
+              print(f"✅ MHTML saved to: {output_file}")
+              if args.extract_links:
+                  print(f"✅ {link_count} links extracted to: {output_file.replace('.mhtml', '_links.txt')}")
+          EOF
+
+      - name: Run MHTML downloader
+        run: |
+          EXTRACT=""
+          if [ "${{ github.event.inputs.extract_links }}" == "true" ]; then
+            EXTRACT="--extract-links"
+          fi
+          python save_as_mhtml.py \
+            --url "${{ github.event.inputs.url }}" \
+            ${EXTRACT} \
+            ${GITHUB_ACTOR:+--title "${{ github.event.inputs.title }}"}
+
+      - name: Upload to GitHub Releases (Private Draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mhtml-${{ github.run_number }}
+          name: "MHTML - ${{ github.event.inputs.url }}"
+          body: |
+            **📄 MHTML Archive**
+            **URL:** ${{ github.event.inputs.url }}
+            **Links extracted:** ${{ github.event.inputs.extract_links }}
+            **Date:** $(date '+%Y-%m-%d %H:%M:%S')
+          files: download/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf download
