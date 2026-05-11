@@ -1,0 +1,139 @@
+name: دانلود فیلم با کیفیت دلخواه
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'لینک فیلم (یوتیوب، آپارات، اینستاگرام، یا لینک مستقیم MP4)'
+        required: true
+        type: string
+      password:
+        description: 'رمز عبور برای فایل ZIP'
+        required: true
+        type: string
+      quality:
+        description: 'کیفیت مورد نظر'
+        required: false
+        type: choice
+        options:
+          - best (بهترین کیفیت)
+          - 2160p (4K)
+          - 1440p (2K)
+          - 1080p (Full HD)
+          - 720p (HD)
+          - 480p
+          - 360p
+          - worst (بدترین کیفیت)
+        default: 'best (بهترین کیفیت)'
+      custom_title:
+        description: 'عنوان دلخواه برای فایل (اختیار - خالی بگذارید خودکار شود)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yt-dlp
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          pip install yt-dlp
+
+      - name: Get video info and download
+        id: download
+        run: |
+          URL="${{ github.event.inputs.video_url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          
+          # تبدیل کیفیت به فرمت yt-dlp
+          case "$QUALITY" in
+            "best (بهترین کیفیت)") QUALITY_FMT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ;;
+            "2160p (4K)") QUALITY_FMT="bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160][ext=mp4]" ;;
+            "1440p (2K)") QUALITY_FMT="bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/best[height<=1440][ext=mp4]" ;;
+            "1080p (Full HD)") QUALITY_FMT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]" ;;
+            "720p (HD)") QUALITY_FMT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]" ;;
+            "480p") QUALITY_FMT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]" ;;
+            "360p") QUALITY_FMT="bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]" ;;
+            "worst (بدترین کیفیت)") QUALITY_FMT="worst[ext=mp4]" ;;
+            *) QUALITY_FMT="best[ext=mp4]" ;;
+          esac
+          
+          # دریافت عنوان فیلم
+          TITLE="${{ github.event.inputs.custom_title }}"
+          if [ -z "$TITLE" ]; then
+            # استخراج عنوان خودکار از لینک
+            TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | sed 's/[^a-zA-Z0-9\-_()]/_/g' | cut -c1-80)
+            if [ -z "$TITLE" ]; then
+              TITLE="video_$(date +%Y%m%d_%H%M%S)"
+            fi
+          fi
+          
+          echo "🎬 Downloading: $TITLE"
+          echo "📊 Quality: $QUALITY"
+          
+          # دانلود فیلم
+          yt-dlp -f "$QUALITY_FMT" \
+            -o "downloaded_video.%(ext)s" \
+            --no-warnings \
+            --no-playlist \
+            --retries 5 \
+            "$URL"
+          
+          # پیدا کردن فایل دانلود شده
+          VIDEO_FILE=$(ls downloaded_video.* 2>/dev/null | head -1)
+          
+          if [ ! -f "$VIDEO_FILE" ]; then
+            echo "❌ Download failed!"
+            exit 1
+          fi
+          
+          # تغییر نام به فایل نهایی
+          FINAL_NAME="${TITLE}.mp4"
+          mv "$VIDEO_FILE" "$FINAL_NAME"
+          
+          echo "filename=$FINAL_NAME" >> $GITHUB_OUTPUT
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          echo "✅ Downloaded: $FINAL_NAME"
+          
+          # نمایش اطلاعات فیلم
+          ls -lh "$FINAL_NAME"
+
+      - name: Create password-protected ZIP
+        id: zip
+        run: |
+          sudo apt-get install -y zip
+          
+          FILENAME="${{ steps.download.outputs.filename }}"
+          ZIP_NAME="${FILENAME%.mp4}.zip"
+          
+          zip -j -P "${{ github.event.inputs.password }}" "$ZIP_NAME" "$FILENAME"
+          
+          echo "zipname=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Created: $ZIP_NAME"
+
+      - name: Commit and push ZIP to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          ZIP_FILE="${{ steps.zip.outputs.zipname }}"
+          
+          git add "$ZIP_FILE"
+          git commit -m "🎬 Video: ${{ steps.download.outputs.title }} [skip ci]" || echo "Nothing to commit"
+          git push
+          
+          echo "✅ Committed: $ZIP_FILE"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f *.mp4 *.webm *.mkv *.zip downloaded_video.*
