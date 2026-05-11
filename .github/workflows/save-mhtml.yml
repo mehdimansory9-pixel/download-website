@@ -8,14 +8,18 @@ on:
         required: true
         type: string
       title:
-        description: 'Optional title for the output file (no spaces/special chars)'
+        description: 'عنوان فایل خروجی (بدون فاصله - مثال: my_page)'
+        required: true
+        type: string
+      password:
+        description: 'رمز عبور برای فایل ZIP'
+        required: true
+        type: string
+      max_links:
+        description: 'حداکثر تعداد لینک‌های داخلی برای ذخیره (۰ = نامحدود)'
         required: false
         type: string
-      extract_links:
-        description: 'استخراج لینک‌های داخل صفحه و ذخیره در فایل جداگانه؟'
-        required: false
-        type: boolean
-        default: true
+        default: '10'
 
 permissions:
   contents: write
@@ -34,95 +38,131 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pyppeteer beautifulsoup4
+          pip install pyppeteer beautifulsoup4 aiohttp
 
       - name: Create Python script
         run: |
-          cat > save_as_mhtml.py << 'EOF'
+          cat > save_all_as_mhtml.py << 'EOF'
           import asyncio
           import os
           import re
           from pyppeteer import launch
           from bs4 import BeautifulSoup
-          import sys
           import argparse
+          from urllib.parse import urljoin, urlparse
           
-          async def save_mhtml(url, output_path):
-              browser = await launch(headless=True, args=['--no-sandbox'])
-              page = await browser.newPage()
+          async def save_mhtml(page, url, output_path):
+              """ذخیره یک صفحه به صورت MHTML"""
               await page.goto(url, waitUntil='networkidle2')
-              
-              # استخراج لینک‌ها
-              content = await page.content()
-              soup = BeautifulSoup(content, 'html.parser')
-              links = []
-              for a in soup.find_all('a', href=True):
-                  href = a['href']
-                  if href.startswith('http') and not href.startswith('javascript:'):
-                      links.append(href)
-              links = list(dict.fromkeys(links))
-              
-              # ذخیره لینک‌ها در فایل جداگانه
-              links_file = output_path.replace('.mhtml', '_links.txt')
-              with open(links_file, 'w', encoding='utf-8') as f:
-                  for link in links:
-                      f.write(link + '\n')
-              
-              # ذخیره MHTML
-              client = await page.target.createCDPSession()
-              await client.send('Page.captureSnapshot', {'format': 'mhtml'})
-              
               cdp = await page.target.createCDPSession()
               result = await cdp.send('Page.captureSnapshot', {})
               with open(output_path, 'w', encoding='utf-8') as f:
                   f.write(result['data'])
-              
-              await browser.close()
-              return len(links)
+              return True
           
-          if __name__ == '__main__':
+          async def main():
               parser = argparse.ArgumentParser()
               parser.add_argument('--url', required=True)
-              parser.add_argument('--title')
-              parser.add_argument('--extract-links', action='store_true')
+              parser.add_argument('--title', required=True)
+              parser.add_argument('--max-links', default='10')
               args = parser.parse_args()
               
-              title = args.title
-              if not title:
-                  # پاک کردن کاراکترهای غیرمجاز از URL
-                  title = re.sub(r'[^\w\-_\.]', '_', args.url.split('//')[-1].split('/')[0])
+              max_links = int(args.max_links) if args.max_links != '0' else 999
               
-              os.makedirs('download', exist_ok=True)
-              output_file = f"download/{title}.mhtml"
+              # پوشه اصلی برای ذخیره
+              os.makedirs('downloader', exist_ok=True)
               
-              link_count = asyncio.get_event_loop().run_until_complete(
-                  save_mhtml(args.url, output_file)
-              )
+              browser = await launch(headless=True, args=['--no-sandbox'])
+              page = await browser.newPage()
               
-              print(f"✅ MHTML saved to: {output_file}")
-              if args.extract_links:
-                  print(f"✅ {link_count} links extracted to: {output_file.replace('.mhtml', '_links.txt')}")
+              # رفتن به صفحه اصلی
+              await page.goto(args.url, waitUntil='networkidle2')
+              
+              # استخراج لینک‌های داخلی
+              content = await page.content()
+              soup = BeautifulSoup(content, 'html.parser')
+              
+              base_domain = urlparse(args.url).netloc
+              links = []
+              
+              for a in soup.find_all('a', href=True):
+                  href = a['href']
+                  full_url = urljoin(args.url, href)
+                  parsed = urlparse(full_url)
+                  if parsed.netloc == base_domain and parsed.scheme in ['http', 'https']:
+                      if full_url not in links and full_url != args.url:
+                          links.append(full_url)
+              
+              # محدود کردن تعداد لینک‌ها
+              links = links[:max_links]
+              print(f"🔗 {len(links)} internal links found")
+              
+              # ذخیره صفحه اصلی (با عنوان کاربر)
+              main_file = f"downloader/{args.title}.mhtml"
+              await save_mhtml(page, args.url, main_file)
+              print(f"✅ Main page saved: {main_file}")
+              
+              # ذخیره صفحات لینک شده
+              saved_files = [main_file]
+              for i, link in enumerate(links, 1):
+                  link_title = f"{args.title}_link_{i}"
+                  link_file = f"downloader/{link_title}.mhtml"
+                  try:
+                      new_page = await browser.newPage()
+                      await save_mhtml(new_page, link, link_file)
+                      saved_files.append(link_file)
+                      print(f"✅ [{i}/{len(links)}] Saved: {link}")
+                      await new_page.close()
+                  except Exception as e:
+                      print(f"❌ Failed: {link} - {e}")
+              
+              await browser.close()
+              
+              # نوشتن لیست فایل‌ها برای zipping
+              with open('files_to_zip.txt', 'w') as f:
+                  for file in saved_files:
+                      f.write(file + '\n')
+              
+              print(f"\n🎉 Done! {len(saved_files)} files saved in 'downloader/' folder")
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
           EOF
 
       - name: Run MHTML downloader
         run: |
-          EXTRACT=""
-          if [ "${{ github.event.inputs.extract_links }}" == "true" ]; then
-            EXTRACT="--extract-links"
-          fi
-          python save_as_mhtml.py \
+          python save_all_as_mhtml.py \
             --url "${{ github.event.inputs.url }}" \
-            ${EXTRACT} \
-            ${GITHUB_ACTOR:+--title "${{ github.event.inputs.title }}"}
+            --title "${{ github.event.inputs.title }}" \
+            --max-links "${{ github.event.inputs.max_links }}"
 
-      - name: 📤 Upload as Artifact (بدون نیاز به Release)
-        uses: actions/upload-artifact@v4
-        with:
-          name: mhtml-${{ github.run_id }}
-          path: download/
-          retention-days: 90
+      - name: Create password-protected ZIP
+        run: |
+          # نصب zip با قابلیت رمز
+          sudo apt-get install -y zip
+          
+          # فشرده‌سازی با رمز عبور
+          zip -j -P "${{ github.event.inputs.password }}" \
+            "${{ github.event.inputs.title }}.zip" \
+            downloader/*.mhtml
+          
+          echo "✅ ZIP created: ${{ github.event.inputs.title }}.zip"
 
-      - name: 🧹 Cleanup
+      - name: Commit and push ZIP to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # اضافه کردن فقط فایل ZIP (نه فایل‌های جداگانه)
+          git add "${{ github.event.inputs.title }}.zip"
+          
+          # commit فقط اگر تغییری وجود داشته باشد
+          git commit -m "📦 MHTML archive: ${{ github.event.inputs.title }} [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: Cleanup (حذف فایل‌های موقت)
         if: always()
         run: |
-          rm -rf download
+          rm -rf downloader
+          rm -f files_to_zip.txt
+          rm -f save_all_as_mhtml.py
